@@ -13,7 +13,7 @@ if __name__ == '__main__':
     if not os.path.exists(output_folder):
         os.mkdir(output_folder)
 
-    # draw_flow_field(6000, 4000)
+        draw_flow_field(6000, 4000)
     # draw_white_noise(600, 300, f'{output_folder}/white_noise.jpg')
     # draw_perlin(5, 5, 1000, 1000, 'output_image.jpg')
     # draw_vectors(5, 5, 1000, 1000)
