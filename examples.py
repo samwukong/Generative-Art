@@ -456,6 +456,12 @@ def _render_flow_field_variant(args):
     # Normalize magnitude to [0, 1] for weight lookup
     mag_norm = (mag - mag.min()) / (mag.max() - mag.min() + 1e-10)
 
+    # --- #5 Attractor / Repulsor points ---
+    # Compositional focal points that nudge flow toward/away from key areas.
+    # Each variant gets its own arrangement (seeded from variant seed).
+    attractors = make_attractors(width, height, n_attractors=3, n_repulsors=2,
+                                 seed=seed)
+
     # --- Particle tracing (vectorized) ---
     xs = np.random.randint(0, width, size=num_particles).astype(np.float64)
     ys = np.random.randint(0, height, size=num_particles).astype(np.float64)
@@ -475,9 +481,17 @@ def _render_flow_field_variant(args):
             xi = np.clip(xs[idx].astype(np.int64), 0, width - 1)
             yi = np.clip(ys[idx].astype(np.int64), 0, height - 1)
 
-            # Sample the curl velocity field directly — no angle conversion
+            # Sample curl velocity, then blend in attractor/repulsor forces
             vx = vx_field[xi, yi]
             vy = vy_field[xi, yi]
+            vx, vy = apply_attractors(xs[idx], ys[idx], vx, vy, attractors,
+                                      influence_radius=max(width, height) * 0.3)
+
+            # Re-normalize so step_size stays consistent
+            vmag = np.sqrt(vx**2 + vy**2)
+            vmag[vmag < 1e-10] = 1e-10
+            vx /= vmag
+            vy /= vmag
 
             x_new = xs[idx] + step_size * vx
             y_new = ys[idx] + step_size * vy
