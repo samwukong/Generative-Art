@@ -18,6 +18,7 @@ import painter
 from utils import (QColor_HSV, save, Perlin2D, FractalPerlin2D,
                    DomainWarp, CurlNoise2D, COLOR_PALETTES, palette_color,
                    make_attractors, apply_attractors)
+from metal_compute import MetalTracer
 
 
 def draw_white_noise(width, height, fname):
@@ -402,21 +403,21 @@ def draw_delta_body(width, height, seed=random.randint(0, 100000000), mode='nois
 
 def _render_flow_field_variant(args):
     """
-    Render a single color variant of the enhanced flow field.
-    Designed to run in a separate process for parallel rendering.
+    Render a single flow field variant using domain-warped curl noise.
 
-    Each variant generates its OWN unique fractal noise field from its own
-    seed, so every image has genuinely different flow patterns — not just
-    a different color on the same underlying shapes.
-
-    The flow line tracing is vectorized: all particles advance simultaneously
-    each step using NumPy bulk operations instead of per-particle Python loops.
+    Pipeline per variant:
+      1. Seed RNG uniquely so every image gets different structure
+      2. Build a fractal Perlin potential field
+      3. Domain-warp it (distort coordinate space for swirling forms)
+      4. Derive curl noise velocity field (divergence-free, no sinks)
+      5. Trace particles through the (vx, vy) field
+      6. Draw with batched, color-grouped QPainter calls
     """
-    width, height, mod, seed, num_particles, max_length, step_size, noise_params = args
+    (width, height, palette_name, seed, num_particles, max_length, step_size,
+     noise_params, warp_strength, depth_layers) = args
     from PyQt5.QtWidgets import QApplication
     import sys
 
-    # Each subprocess needs its own QApplication instance
     _app = QApplication.instance() or QApplication(sys.argv)
 
     np.random.seed(seed)
@@ -426,89 +427,190 @@ def _render_flow_field_variant(args):
     p.setRenderHint(p.Antialiasing)
     p.fillRect(0, 0, width, height, QColor(0, 0, 0))
 
-    # Generate a UNIQUE fractal noise field for this variant — this is what
-    # gives each image genuinely different flow patterns, not just color shifts
+    # --- #1 Domain Warping + #2 Curl Noise ---
+    # Build the potential field: fractal Perlin warped through distorted coords
     octaves, persistence, lacunarity, base_nx, base_ny = noise_params
-    p_noise = FractalPerlin2D(width, height, base_nx, base_ny,
-                              octaves=octaves, persistence=persistence,
-                              lacunarity=lacunarity)
 
-    # Each variant also gets its own random starting positions
-    xs = np.random.randint(0, width, size=num_particles).astype(np.float64)
-    ys = np.random.randint(0, height, size=num_particles).astype(np.float64)
-    lengths = np.zeros(num_particles, dtype=np.float64)
-    active = np.ones(num_particles, dtype=bool)
+    def _base_noise(w, h):
+        return FractalPerlin2D(w, h, base_nx, base_ny,
+                               octaves=octaves, persistence=persistence,
+                               lacunarity=lacunarity)
 
-    # Collect segments in batches, then flush grouped by color to minimize
-    # expensive QPainter setPen() state changes
-    BATCH_SIZE = 50
+    if warp_strength > 0:
+        potential = DomainWarp(width, height, _base_noise,
+                               warp_strength=warp_strength, warp_octaves=4)
+    else:
+        potential = _base_noise(width, height)
 
-    while np.any(active):
-        batch_segments = []
+    # Curl of the potential gives a divergence-free velocity field —
+    # particles flow along iso-lines, never converging to a point
+    vx_field, vy_field = CurlNoise2D(potential, scale=1.0)
 
-        for _ in range(BATCH_SIZE):
-            if not np.any(active):
-                break
+    # --- #3 Variable Line Weight ---
+    # Keep raw magnitude before normalizing — this drives pen width.
+    # High curl gradient = thick lines, low = thin. Reveals field structure.
+    mag = np.sqrt(vx_field**2 + vy_field**2)
+    mag[mag < 1e-10] = 1e-10
+    vx_field /= mag
+    vy_field /= mag
 
-            idx = np.where(active)[0]
-            xi = np.clip(xs[idx].astype(np.int64), 0, width - 1)
-            yi = np.clip(ys[idx].astype(np.int64), 0, height - 1)
+    # Normalize magnitude to [0, 1] for weight lookup
+    mag_norm = (mag - mag.min()) / (mag.max() - mag.min() + 1e-10)
 
-            # Vectorized angle lookup and trig for ALL active particles at once
-            angles = p_noise[xi, yi] * math.pi
-            cos_a = np.cos(angles)
-            sin_a = np.sin(angles)
+    # --- #5 Attractor / Repulsor points ---
+    # Compositional focal points that nudge flow toward/away from key areas.
+    # Each variant gets its own arrangement (seeded from variant seed).
+    attractors = make_attractors(width, height, n_attractors=3, n_repulsors=2,
+                                 seed=seed)
+    influence_radius = max(width, height) * 0.3
 
-            x_new = xs[idx] + step_size * cos_a
-            y_new = ys[idx] + step_size * sin_a
+    # --- #8 Metal GPU acceleration ---
+    # Offload particle advection to GPU if Metal is available (macOS only).
+    # Falls back to NumPy transparently on Linux/Windows.
+    gpu = MetalTracer(width, height, vx_field, vy_field, attractors,
+                      influence_radius)
 
-            # Vectorized color: saturation fades with trail length, hue shifts
-            # with vertical position for a gradient across the canvas
-            sat = 200.0 * (max_length - lengths[idx]) / max_length
-            hue = (mod + 130.0 * (height - ys[idx]) / height) % 360
+    # --- #7 Depth Layering ---
+    # Render particles in back-to-front layers. Back layers are faint/thin
+    # (distant atmosphere), front layers are vivid/thick (foreground detail).
+    # Each layer gets its own particles, alpha, weight scale, and step size.
+    layer_configs = []
+    for li in range(depth_layers):
+        # t goes 0.0 (back) to 1.0 (front)
+        t = li / max(depth_layers - 1, 1)
+        layer_configs.append({
+            'alpha': int(8 + 22 * t),            # 8 -> 30
+            'weight_scale': 0.4 + 0.8 * t,       # 0.4x -> 1.2x
+            'step_scale': 0.7 + 0.5 * t,         # 0.7x -> 1.2x
+            'sat_scale': 0.5 + 0.5 * t,          # muted -> full
+            'n_particles': int(num_particles * (0.5 + 0.5 * t) / depth_layers),
+        })
 
-            batch_segments.append((
-                hue.copy(), sat.copy(),
-                xs[idx].copy(), ys[idx].copy(),
-                x_new.copy(), y_new.copy()
-            ))
+    total_traced = 0
 
-            seg_len = np.sqrt((x_new - xs[idx])**2 + (y_new - ys[idx])**2)
-            lengths[idx] += seg_len
-            xs[idx] = x_new
-            ys[idx] = y_new
+    for li, lcfg in enumerate(layer_configs):
+        l_alpha = lcfg['alpha']
+        l_wt_scale = lcfg['weight_scale']
+        l_step = step_size * lcfg['step_scale']
+        l_sat_scale = lcfg['sat_scale']
+        l_np = lcfg['n_particles']
 
-            oob = (x_new < 0) | (x_new >= width) | (y_new < 0) | (y_new >= height)
-            maxed = lengths[idx] > max_length
-            active[idx[oob | maxed]] = False
+        xs = np.random.randint(0, width, size=l_np).astype(np.float64)
+        ys = np.random.randint(0, height, size=l_np).astype(np.float64)
+        lengths = np.zeros(l_np, dtype=np.float64)
+        active = np.ones(l_np, dtype=bool)
 
-        # Flush: group by quantized color to reduce setPen calls
-        for hue_arr, sat_arr, x0, y0, x1, y1 in batch_segments:
-            # Quantize to bins of 5 — visually identical, far fewer pen swaps
-            hue_q = (hue_arr / 5).astype(np.int32) * 5
-            sat_q = (sat_arr / 5).astype(np.int32) * 5
-            color_keys = hue_q * 1000 + sat_q
+        BATCH_SIZE = 50
 
-            for ck in np.unique(color_keys):
-                mask = color_keys == ck
-                h = int(hue_q[mask][0]) % 360
-                s = max(0, min(255, int(sat_q[mask][0])))
-                p.setPen(QPen(QColor_HSV(h, s, 255, 20), 2))
+        while np.any(active):
+            batch_segments = []
 
-                for j in np.where(mask)[0]:
-                    p.drawLine(QPointF(x0[j], y0[j]), QPointF(x1[j], y1[j]))
+            for _ in range(BATCH_SIZE):
+                if not np.any(active):
+                    break
 
-    traced = num_particles - int(np.sum(active))
-    print(f'  Hue {mod}: done ({traced}/{num_particles} particles traced)')
+                if gpu.gpu_available:
+                    # --- GPU path: Metal computes advection ---
+                    old_xs, old_ys, new_xs, new_ys, was_active = \
+                        gpu.step_gpu(xs, ys, lengths, active,
+                                     l_step, max_length)
 
-    fname = f'enhanced_flow_{mod}_{seed}'
+                    # Filter to particles that were active this step
+                    idx = np.where(was_active)[0]
+                    if len(idx) == 0:
+                        break
+                    xi = np.clip(old_xs[idx].astype(np.int64), 0, width - 1)
+                    yi = np.clip(old_ys[idx].astype(np.int64), 0, height - 1)
+                    x_old_seg = old_xs[idx]
+                    y_old_seg = old_ys[idx]
+                    x_new_seg = new_xs[idx]
+                    y_new_seg = new_ys[idx]
+                else:
+                    # --- CPU path: NumPy advection ---
+                    idx = np.where(active)[0]
+                    xi = np.clip(xs[idx].astype(np.int64), 0, width - 1)
+                    yi = np.clip(ys[idx].astype(np.int64), 0, height - 1)
+
+                    vx = vx_field[xi, yi]
+                    vy = vy_field[xi, yi]
+                    vx, vy = apply_attractors(
+                        xs[idx], ys[idx], vx, vy, attractors,
+                        influence_radius=influence_radius)
+
+                    vmag = np.sqrt(vx**2 + vy**2)
+                    vmag[vmag < 1e-10] = 1e-10
+                    vx /= vmag
+                    vy /= vmag
+
+                    x_new = xs[idx] + l_step * vx
+                    y_new = ys[idx] + l_step * vy
+
+                    x_old_seg = xs[idx].copy()
+                    y_old_seg = ys[idx].copy()
+                    x_new_seg = x_new
+                    y_new_seg = y_new
+
+                    seg_len = np.sqrt((x_new - xs[idx])**2 +
+                                      (y_new - ys[idx])**2)
+                    lengths[idx] += seg_len
+                    xs[idx] = x_new
+                    ys[idx] = y_new
+
+                    oob = ((x_new < 0) | (x_new >= width) |
+                           (y_new < 0) | (y_new >= height))
+                    maxed = lengths[idx] > max_length
+                    active[idx[oob | maxed]] = False
+
+                # --- Color and weight (shared by GPU and CPU paths) ---
+                color_t = y_old_seg / height
+                hue, sat_base, val = palette_color(palette_name, color_t)
+                trail_fade = (max_length - lengths[idx]) / max_length
+                sat = sat_base * trail_fade * l_sat_scale
+
+                trail_t = lengths[idx] / max_length
+                mag_component = 0.5 + 0.5 * mag_norm[xi, yi]
+                taper = 1.0 - 0.7 * trail_t
+                weight = mag_component * taper * l_wt_scale
+
+                batch_segments.append((
+                    hue.copy(), sat.copy(), val.copy(),
+                    x_old_seg.copy(), y_old_seg.copy(),
+                    x_new_seg.copy(), y_new_seg.copy(),
+                    weight.copy()
+                ))
+
+            # Flush: group by quantized color + weight to reduce setPen calls
+            for hue_arr, sat_arr, val_arr, x0, y0, x1, y1, wt_arr in batch_segments:
+                hue_q = (hue_arr / 5).astype(np.int32) * 5
+                sat_q = (sat_arr / 5).astype(np.int32) * 5
+                val_q = (val_arr / 5).astype(np.int32) * 5
+                wt_q = np.clip((wt_arr * 4).astype(np.int32), 0, 3)
+                color_keys = hue_q * 100000 + sat_q * 1000 + val_q * 10 + wt_q
+
+                for ck in np.unique(color_keys):
+                    mask = color_keys == ck
+                    h = int(hue_q[mask][0]) % 360
+                    s = max(0, min(255, int(sat_q[mask][0])))
+                    v = max(0, min(255, int(val_q[mask][0])))
+                    w = 0.5 + int(wt_q[mask][0])
+                    p.setPen(QPen(QColor_HSV(h, s, v, l_alpha), w))
+
+                    for j in np.where(mask)[0]:
+                        p.drawLine(QPointF(x0[j], y0[j]), QPointF(x1[j], y1[j]))
+
+        total_traced += l_np - int(np.sum(active))
+
+    print(f'  {palette_name}: done ({total_traced}/{num_particles} particles '
+          f'across {depth_layers} layers)')
+
+    fname = f'enhanced_flow_{palette_name}_{seed}'
     save(p, fname=fname, folder='Images', overwrite=True)
     return fname
 
 
 def draw_flow_field_enhanced(width=7680, height=4320,
                              seed=None,
-                             colors=None,
+                             palettes=None,
                              num_particles=None,
                              max_length=None,
                              step_size=None,
@@ -516,55 +618,55 @@ def draw_flow_field_enhanced(width=7680, height=4320,
                              persistence=0.5,
                              lacunarity=2,
                              base_nx=2, base_ny=2,
+                             warp_strength=100.0,
+                             multi_field=True,
+                             depth_layers=3,
                              parallel=True):
     """
-    Enhanced flow field generator optimized for Apple Silicon.
+    Enhanced flow field generator with domain-warped curl noise.
 
-    Key improvements over draw_flow_field:
-    - Each color variant gets its OWN unique noise field and particle positions,
-      producing genuinely different flow patterns instead of identical shapes
-      in different colors
-    - Vectorized particle tracing (all particles advance simultaneously via NumPy)
-    - Batched QPainter draw calls grouped by color to minimize state changes
-    - Multi-octave fractal Perlin noise for richer, more organic patterns
-    - Multiprocessing to render color variants across CPU cores in parallel
-    - Higher default resolution (8K) and particle density
+    Noise pipeline: FractalPerlin -> DomainWarp -> CurlNoise -> (vx, vy)
 
     Parameters:
     -----------
-    width : int
-        Canvas width in pixels (default: 7680 for 8K)
-    height : int
-        Canvas height in pixels (default: 4320 for 8K)
+    width, height : int
+        Canvas dimensions (default: 7680x4320 for 8K)
     seed : int or None
-        Random seed for reproducibility (None = random)
-    colors : list of int
-        HSV hue values for each variant (default: [200, 140, 70, 340, 280])
+        Random seed for reproducibility
+    palettes : list of str
+        Color palette names from COLOR_PALETTES for each variant.
+        Available: ocean, sunset, forest, neon, ember, ice, aurora, monochrome
     num_particles : int or None
-        Number of flow lines (None = width*height/500 for denser coverage)
+        Number of flow lines (None = width*height/500)
     max_length : int or None
-        Max trace length per particle (None = 3*width for longer trails)
+        Max trace length per particle (None = 3*width)
     step_size : float or None
-        Distance per trace step (None = 0.001*max(width, height))
+        Distance per trace step (None = 0.001*max(w,h))
     octaves : int
-        Fractal noise octaves (more = finer turbulent detail)
+        Base fractal noise octaves (varied per variant if multi_field=True)
     persistence : float
-        Amplitude falloff per octave
+        Base amplitude falloff per octave
     lacunarity : int
         Frequency multiplier per octave
-    base_nx : int
-        Base Perlin tile count X
-    base_ny : int
-        Base Perlin tile count Y
+    base_nx, base_ny : int
+        Base Perlin tile counts
+    warp_strength : float
+        Base domain warp displacement in pixels (0 = no warp)
+    multi_field : bool
+        If True, randomize noise parameters per variant so every image
+        has unique structure, not just a different seed on the same config
+    depth_layers : int
+        Number of depth layers (1 = flat, 3 = back/mid/front).
+        Back layers are faint and thin, front layers are vivid and thick.
     parallel : bool
-        If True, render color variants in parallel processes
+        Render color variants in parallel processes
     """
     import platform
 
     if seed is None:
         seed = random.randint(0, 100000000)
-    if colors is None:
-        colors = [200, 140, 70, 340, 280]
+    if palettes is None:
+        palettes = ['ocean', 'sunset', 'forest', 'neon', 'ember']
     if num_particles is None:
         num_particles = int(width * height / 500)
     if max_length is None:
@@ -572,28 +674,48 @@ def draw_flow_field_enhanced(width=7680, height=4320,
     if step_size is None:
         step_size = 0.001 * max(width, height)
 
-    noise_params = (octaves, persistence, lacunarity, base_nx, base_ny)
-
     print(f'Enhanced Flow Field: {width}x{height}, {num_particles} particles, '
-          f'{len(colors)} variants, seed={seed}')
-    print(f'Fractal noise: {octaves} octaves, persistence={persistence}, '
-          f'lacunarity={lacunarity}')
+          f'{len(palettes)} variants, seed={seed}')
+    print(f'Palettes: {palettes}')
 
-    # Each variant gets a unique seed derived from the base seed, offset by a
-    # prime so the noise fields are fully decorrelated from one another
+    # --- #6 Multi-field control ---
+    # Each variant gets its own noise parameters derived from the base values,
+    # so every image has genuinely different field character.
     task_args = []
-    for i, mod in enumerate(colors):
+    for i, pal in enumerate(palettes):
         variant_seed = seed + i * 7919
-        task_args.append((width, height, mod, variant_seed, num_particles,
-                          max_length, step_size, noise_params))
+
+        if multi_field:
+            rng = np.random.RandomState(variant_seed)
+            v_octaves = max(3, octaves + rng.randint(-2, 3))
+            v_persistence = np.clip(persistence + rng.uniform(-0.15, 0.15),
+                                    0.3, 0.7)
+            v_nx = rng.choice([1, 2, 3, 4])
+            v_ny = rng.choice([1, 2, 3, 4])
+            v_warp = max(0, warp_strength + rng.uniform(-40, 40))
+            print(f'  {pal}: octaves={v_octaves}, persistence={v_persistence:.2f}, '
+                  f'tiles={v_nx}x{v_ny}, warp={v_warp:.0f}px')
+        else:
+            v_octaves = octaves
+            v_persistence = persistence
+            v_nx = base_nx
+            v_ny = base_ny
+            v_warp = warp_strength
+
+        noise_params = (v_octaves, v_persistence, lacunarity, v_nx, v_ny)
+        task_args.append((width, height, pal, variant_seed, num_particles,
+                          max_length, step_size, noise_params, v_warp,
+                          depth_layers))
+
+    if not multi_field:
+        print(f'Noise: {octaves} octaves, persistence={persistence}, '
+              f'lacunarity={lacunarity}, warp={warp_strength}px')
 
     t0 = time.time()
 
-    if parallel and len(colors) > 1:
+    if parallel and len(palettes) > 1:
         import multiprocessing as mp
 
-        # macOS (Apple Silicon) should use 'fork' for fast subprocess start;
-        # Windows must use 'spawn' as it lacks fork(). We detect and adapt.
         if platform.system() == 'Darwin':
             ctx = mp.get_context('fork')
         elif platform.system() == 'Windows':
@@ -601,13 +723,13 @@ def draw_flow_field_enhanced(width=7680, height=4320,
         else:
             ctx = mp.get_context()
 
-        n_workers = min(len(colors), ctx.cpu_count())
-        print(f'Rendering {len(colors)} variants in parallel '
+        n_workers = min(len(palettes), ctx.cpu_count())
+        print(f'Rendering {len(palettes)} variants in parallel '
               f'({n_workers} workers, {ctx.get_start_method()} mode)...')
         with ctx.Pool(processes=n_workers) as pool:
             results = pool.map(_render_flow_field_variant, task_args)
     else:
-        print(f'Rendering {len(colors)} variants sequentially...')
+        print(f'Rendering {len(palettes)} variants sequentially...')
         results = [_render_flow_field_variant(a) for a in task_args]
 
     elapsed = time.time() - t0
