@@ -413,7 +413,7 @@ def _render_flow_field_variant(args):
       6. Draw with batched, color-grouped QPainter calls
     """
     (width, height, palette_name, seed, num_particles, max_length, step_size,
-     noise_params, warp_strength) = args
+     noise_params, warp_strength, depth_layers) = args
     from PyQt5.QtWidgets import QApplication
     import sys
 
@@ -462,93 +462,114 @@ def _render_flow_field_variant(args):
     attractors = make_attractors(width, height, n_attractors=3, n_repulsors=2,
                                  seed=seed)
 
-    # --- Particle tracing (vectorized) ---
-    xs = np.random.randint(0, width, size=num_particles).astype(np.float64)
-    ys = np.random.randint(0, height, size=num_particles).astype(np.float64)
-    lengths = np.zeros(num_particles, dtype=np.float64)
-    active = np.ones(num_particles, dtype=bool)
+    # --- #7 Depth Layering ---
+    # Render particles in back-to-front layers. Back layers are faint/thin
+    # (distant atmosphere), front layers are vivid/thick (foreground detail).
+    # Each layer gets its own particles, alpha, weight scale, and step size.
+    layer_configs = []
+    for li in range(depth_layers):
+        # t goes 0.0 (back) to 1.0 (front)
+        t = li / max(depth_layers - 1, 1)
+        layer_configs.append({
+            'alpha': int(8 + 22 * t),            # 8 -> 30
+            'weight_scale': 0.4 + 0.8 * t,       # 0.4x -> 1.2x
+            'step_scale': 0.7 + 0.5 * t,         # 0.7x -> 1.2x
+            'sat_scale': 0.5 + 0.5 * t,          # muted -> full
+            'n_particles': int(num_particles * (0.5 + 0.5 * t) / depth_layers),
+        })
 
-    BATCH_SIZE = 50
+    total_traced = 0
 
-    while np.any(active):
-        batch_segments = []
+    for li, lcfg in enumerate(layer_configs):
+        l_alpha = lcfg['alpha']
+        l_wt_scale = lcfg['weight_scale']
+        l_step = step_size * lcfg['step_scale']
+        l_sat_scale = lcfg['sat_scale']
+        l_np = lcfg['n_particles']
 
-        for _ in range(BATCH_SIZE):
-            if not np.any(active):
-                break
+        xs = np.random.randint(0, width, size=l_np).astype(np.float64)
+        ys = np.random.randint(0, height, size=l_np).astype(np.float64)
+        lengths = np.zeros(l_np, dtype=np.float64)
+        active = np.ones(l_np, dtype=bool)
 
-            idx = np.where(active)[0]
-            xi = np.clip(xs[idx].astype(np.int64), 0, width - 1)
-            yi = np.clip(ys[idx].astype(np.int64), 0, height - 1)
+        BATCH_SIZE = 50
 
-            # Sample curl velocity, then blend in attractor/repulsor forces
-            vx = vx_field[xi, yi]
-            vy = vy_field[xi, yi]
-            vx, vy = apply_attractors(xs[idx], ys[idx], vx, vy, attractors,
-                                      influence_radius=max(width, height) * 0.3)
+        while np.any(active):
+            batch_segments = []
 
-            # Re-normalize so step_size stays consistent
-            vmag = np.sqrt(vx**2 + vy**2)
-            vmag[vmag < 1e-10] = 1e-10
-            vx /= vmag
-            vy /= vmag
+            for _ in range(BATCH_SIZE):
+                if not np.any(active):
+                    break
 
-            x_new = xs[idx] + step_size * vx
-            y_new = ys[idx] + step_size * vy
+                idx = np.where(active)[0]
+                xi = np.clip(xs[idx].astype(np.int64), 0, width - 1)
+                yi = np.clip(ys[idx].astype(np.int64), 0, height - 1)
 
-            # --- #4 Palette-based color ---
-            # Sample palette by vertical position; trail fade modulates sat
-            color_t = ys[idx] / height
-            hue, sat_base, val = palette_color(palette_name, color_t)
-            # Fade saturation along the trail (bright head -> muted tail)
-            trail_fade = (max_length - lengths[idx]) / max_length
-            sat = sat_base * trail_fade
+                # Sample curl velocity, then blend in attractor/repulsor forces
+                vx = vx_field[xi, yi]
+                vy = vy_field[xi, yi]
+                vx, vy = apply_attractors(xs[idx], ys[idx], vx, vy, attractors,
+                                          influence_radius=max(width, height) * 0.3)
 
-            # Line weight: blend of field magnitude and trail taper
-            # mag_component: 0.5-1.0 based on curl strength at this point
-            # taper: 1.0 at head, fading to 0.3 at tail
-            trail_t = lengths[idx] / max_length
-            mag_component = 0.5 + 0.5 * mag_norm[xi, yi]
-            taper = 1.0 - 0.7 * trail_t
-            weight = mag_component * taper  # range ~[0.15, 1.0]
+                vmag = np.sqrt(vx**2 + vy**2)
+                vmag[vmag < 1e-10] = 1e-10
+                vx /= vmag
+                vy /= vmag
 
-            batch_segments.append((
-                hue.copy(), sat.copy(), val.copy(),
-                xs[idx].copy(), ys[idx].copy(),
-                x_new.copy(), y_new.copy(),
-                weight.copy()
-            ))
+                x_new = xs[idx] + l_step * vx
+                y_new = ys[idx] + l_step * vy
 
-            seg_len = np.sqrt((x_new - xs[idx])**2 + (y_new - ys[idx])**2)
-            lengths[idx] += seg_len
-            xs[idx] = x_new
-            ys[idx] = y_new
+                # --- #4 Palette-based color ---
+                color_t = ys[idx] / height
+                hue, sat_base, val = palette_color(palette_name, color_t)
+                trail_fade = (max_length - lengths[idx]) / max_length
+                sat = sat_base * trail_fade * l_sat_scale
 
-            oob = (x_new < 0) | (x_new >= width) | (y_new < 0) | (y_new >= height)
-            maxed = lengths[idx] > max_length
-            active[idx[oob | maxed]] = False
+                # Line weight: field magnitude * trail taper * layer scale
+                trail_t = lengths[idx] / max_length
+                mag_component = 0.5 + 0.5 * mag_norm[xi, yi]
+                taper = 1.0 - 0.7 * trail_t
+                weight = mag_component * taper * l_wt_scale
 
-        # Flush: group by quantized color + weight to reduce setPen calls
-        for hue_arr, sat_arr, val_arr, x0, y0, x1, y1, wt_arr in batch_segments:
-            hue_q = (hue_arr / 5).astype(np.int32) * 5
-            sat_q = (sat_arr / 5).astype(np.int32) * 5
-            val_q = (val_arr / 5).astype(np.int32) * 5
-            wt_q = np.clip((wt_arr * 4).astype(np.int32), 0, 3)
-            color_keys = hue_q * 100000 + sat_q * 1000 + val_q * 10 + wt_q
+                batch_segments.append((
+                    hue.copy(), sat.copy(), val.copy(),
+                    xs[idx].copy(), ys[idx].copy(),
+                    x_new.copy(), y_new.copy(),
+                    weight.copy()
+                ))
 
-            for ck in np.unique(color_keys):
-                mask = color_keys == ck
-                h = int(hue_q[mask][0]) % 360
-                s = max(0, min(255, int(sat_q[mask][0])))
-                v = max(0, min(255, int(val_q[mask][0])))
-                w = 0.5 + int(wt_q[mask][0])
-                p.setPen(QPen(QColor_HSV(h, s, v, 20), w))
+                seg_len = np.sqrt((x_new - xs[idx])**2 + (y_new - ys[idx])**2)
+                lengths[idx] += seg_len
+                xs[idx] = x_new
+                ys[idx] = y_new
 
-                for j in np.where(mask)[0]:
-                    p.drawLine(QPointF(x0[j], y0[j]), QPointF(x1[j], y1[j]))
+                oob = (x_new < 0) | (x_new >= width) | (y_new < 0) | (y_new >= height)
+                maxed = lengths[idx] > max_length
+                active[idx[oob | maxed]] = False
 
-    traced = num_particles - int(np.sum(active))
-    print(f'  {palette_name}: done ({traced}/{num_particles} particles traced)')
+            # Flush: group by quantized color + weight to reduce setPen calls
+            for hue_arr, sat_arr, val_arr, x0, y0, x1, y1, wt_arr in batch_segments:
+                hue_q = (hue_arr / 5).astype(np.int32) * 5
+                sat_q = (sat_arr / 5).astype(np.int32) * 5
+                val_q = (val_arr / 5).astype(np.int32) * 5
+                wt_q = np.clip((wt_arr * 4).astype(np.int32), 0, 3)
+                color_keys = hue_q * 100000 + sat_q * 1000 + val_q * 10 + wt_q
+
+                for ck in np.unique(color_keys):
+                    mask = color_keys == ck
+                    h = int(hue_q[mask][0]) % 360
+                    s = max(0, min(255, int(sat_q[mask][0])))
+                    v = max(0, min(255, int(val_q[mask][0])))
+                    w = 0.5 + int(wt_q[mask][0])
+                    p.setPen(QPen(QColor_HSV(h, s, v, l_alpha), w))
+
+                    for j in np.where(mask)[0]:
+                        p.drawLine(QPointF(x0[j], y0[j]), QPointF(x1[j], y1[j]))
+
+        total_traced += l_np - int(np.sum(active))
+
+    print(f'  {palette_name}: done ({total_traced}/{num_particles} particles '
+          f'across {depth_layers} layers)')
 
     fname = f'enhanced_flow_{palette_name}_{seed}'
     save(p, fname=fname, folder='Images', overwrite=True)
@@ -567,6 +588,7 @@ def draw_flow_field_enhanced(width=7680, height=4320,
                              base_nx=2, base_ny=2,
                              warp_strength=100.0,
                              multi_field=True,
+                             depth_layers=3,
                              parallel=True):
     """
     Enhanced flow field generator with domain-warped curl noise.
@@ -601,6 +623,9 @@ def draw_flow_field_enhanced(width=7680, height=4320,
     multi_field : bool
         If True, randomize noise parameters per variant so every image
         has unique structure, not just a different seed on the same config
+    depth_layers : int
+        Number of depth layers (1 = flat, 3 = back/mid/front).
+        Back layers are faint and thin, front layers are vivid and thick.
     parallel : bool
         Render color variants in parallel processes
     """
@@ -647,7 +672,8 @@ def draw_flow_field_enhanced(width=7680, height=4320,
 
         noise_params = (v_octaves, v_persistence, lacunarity, v_nx, v_ny)
         task_args.append((width, height, pal, variant_seed, num_particles,
-                          max_length, step_size, noise_params, v_warp))
+                          max_length, step_size, noise_params, v_warp,
+                          depth_layers))
 
     if not multi_field:
         print(f'Noise: {octaves} octaves, persistence={persistence}, '
