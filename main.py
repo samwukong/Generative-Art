@@ -15,15 +15,16 @@ if __name__ == '__main__':
     if not os.path.exists(output_folder):
         os.mkdir(output_folder)
 
-    # --- Enhanced flow field (optimized for Apple Silicon) ---
-    # 8K resolution, fractal noise, vectorized tracing, multiprocessing
+    # --- Enhanced flow field (domain-warped curl noise) ---
+    # Pipeline: FractalPerlin -> DomainWarp -> CurlNoise -> (vx, vy)
     draw_flow_field_enhanced(
         width=7680,
         height=4320,
-        octaves=6,          # fractal detail layers
-        persistence=0.5,    # amplitude decay per octave
-        lacunarity=2,       # frequency doubling per octave
-        parallel=True,      # render color variants across CPU cores
+        octaves=6,              # fractal detail layers
+        persistence=0.5,        # amplitude decay per octave
+        lacunarity=2,           # frequency doubling per octave
+        warp_strength=100.0,    # domain warp displacement (px); 0=off
+        parallel=True,          # render color variants across CPU cores
     )
 
     # --- Original examples (uncomment to use) ---

@@ -402,21 +402,21 @@ def draw_delta_body(width, height, seed=random.randint(0, 100000000), mode='nois
 
 def _render_flow_field_variant(args):
     """
-    Render a single color variant of the enhanced flow field.
-    Designed to run in a separate process for parallel rendering.
+    Render a single flow field variant using domain-warped curl noise.
 
-    Each variant generates its OWN unique fractal noise field from its own
-    seed, so every image has genuinely different flow patterns — not just
-    a different color on the same underlying shapes.
-
-    The flow line tracing is vectorized: all particles advance simultaneously
-    each step using NumPy bulk operations instead of per-particle Python loops.
+    Pipeline per variant:
+      1. Seed RNG uniquely so every image gets different structure
+      2. Build a fractal Perlin potential field
+      3. Domain-warp it (distort coordinate space for swirling forms)
+      4. Derive curl noise velocity field (divergence-free, no sinks)
+      5. Trace particles through the (vx, vy) field
+      6. Draw with batched, color-grouped QPainter calls
     """
-    width, height, mod, seed, num_particles, max_length, step_size, noise_params = args
+    (width, height, mod, seed, num_particles, max_length, step_size,
+     noise_params, warp_strength) = args
     from PyQt5.QtWidgets import QApplication
     import sys
 
-    # Each subprocess needs its own QApplication instance
     _app = QApplication.instance() or QApplication(sys.argv)
 
     np.random.seed(seed)
@@ -426,21 +426,37 @@ def _render_flow_field_variant(args):
     p.setRenderHint(p.Antialiasing)
     p.fillRect(0, 0, width, height, QColor(0, 0, 0))
 
-    # Generate a UNIQUE fractal noise field for this variant — this is what
-    # gives each image genuinely different flow patterns, not just color shifts
+    # --- #1 Domain Warping + #2 Curl Noise ---
+    # Build the potential field: fractal Perlin warped through distorted coords
     octaves, persistence, lacunarity, base_nx, base_ny = noise_params
-    p_noise = FractalPerlin2D(width, height, base_nx, base_ny,
-                              octaves=octaves, persistence=persistence,
-                              lacunarity=lacunarity)
 
-    # Each variant also gets its own random starting positions
+    def _base_noise(w, h):
+        return FractalPerlin2D(w, h, base_nx, base_ny,
+                               octaves=octaves, persistence=persistence,
+                               lacunarity=lacunarity)
+
+    if warp_strength > 0:
+        potential = DomainWarp(width, height, _base_noise,
+                               warp_strength=warp_strength, warp_octaves=4)
+    else:
+        potential = _base_noise(width, height)
+
+    # Curl of the potential gives a divergence-free velocity field —
+    # particles flow along iso-lines, never converging to a point
+    vx_field, vy_field = CurlNoise2D(potential, scale=1.0)
+
+    # Normalize velocity magnitude so step_size controls speed uniformly
+    mag = np.sqrt(vx_field**2 + vy_field**2)
+    mag[mag < 1e-10] = 1e-10
+    vx_field /= mag
+    vy_field /= mag
+
+    # --- Particle tracing (vectorized) ---
     xs = np.random.randint(0, width, size=num_particles).astype(np.float64)
     ys = np.random.randint(0, height, size=num_particles).astype(np.float64)
     lengths = np.zeros(num_particles, dtype=np.float64)
     active = np.ones(num_particles, dtype=bool)
 
-    # Collect segments in batches, then flush grouped by color to minimize
-    # expensive QPainter setPen() state changes
     BATCH_SIZE = 50
 
     while np.any(active):
@@ -454,16 +470,14 @@ def _render_flow_field_variant(args):
             xi = np.clip(xs[idx].astype(np.int64), 0, width - 1)
             yi = np.clip(ys[idx].astype(np.int64), 0, height - 1)
 
-            # Vectorized angle lookup and trig for ALL active particles at once
-            angles = p_noise[xi, yi] * math.pi
-            cos_a = np.cos(angles)
-            sin_a = np.sin(angles)
+            # Sample the curl velocity field directly — no angle conversion
+            vx = vx_field[xi, yi]
+            vy = vy_field[xi, yi]
 
-            x_new = xs[idx] + step_size * cos_a
-            y_new = ys[idx] + step_size * sin_a
+            x_new = xs[idx] + step_size * vx
+            y_new = ys[idx] + step_size * vy
 
-            # Vectorized color: saturation fades with trail length, hue shifts
-            # with vertical position for a gradient across the canvas
+            # Color: saturation fades along trail, hue shifts with y-position
             sat = 200.0 * (max_length - lengths[idx]) / max_length
             hue = (mod + 130.0 * (height - ys[idx]) / height) % 360
 
@@ -484,7 +498,6 @@ def _render_flow_field_variant(args):
 
         # Flush: group by quantized color to reduce setPen calls
         for hue_arr, sat_arr, x0, y0, x1, y1 in batch_segments:
-            # Quantize to bins of 5 — visually identical, far fewer pen swaps
             hue_q = (hue_arr / 5).astype(np.int32) * 5
             sat_q = (sat_arr / 5).astype(np.int32) * 5
             color_keys = hue_q * 1000 + sat_q
@@ -516,48 +529,43 @@ def draw_flow_field_enhanced(width=7680, height=4320,
                              persistence=0.5,
                              lacunarity=2,
                              base_nx=2, base_ny=2,
+                             warp_strength=100.0,
                              parallel=True):
     """
-    Enhanced flow field generator optimized for Apple Silicon.
+    Enhanced flow field generator with domain-warped curl noise.
 
-    Key improvements over draw_flow_field:
-    - Each color variant gets its OWN unique noise field and particle positions,
-      producing genuinely different flow patterns instead of identical shapes
-      in different colors
-    - Vectorized particle tracing (all particles advance simultaneously via NumPy)
-    - Batched QPainter draw calls grouped by color to minimize state changes
-    - Multi-octave fractal Perlin noise for richer, more organic patterns
-    - Multiprocessing to render color variants across CPU cores in parallel
-    - Higher default resolution (8K) and particle density
+    Noise pipeline: FractalPerlin -> DomainWarp -> CurlNoise -> (vx, vy)
+
+    This produces divergence-free flow (no sinks/sources) through a
+    coordinate-warped potential field, giving swirling, turbulent,
+    fluid-like structures impossible with plain Perlin angle mapping.
 
     Parameters:
     -----------
-    width : int
-        Canvas width in pixels (default: 7680 for 8K)
-    height : int
-        Canvas height in pixels (default: 4320 for 8K)
+    width, height : int
+        Canvas dimensions (default: 7680x4320 for 8K)
     seed : int or None
-        Random seed for reproducibility (None = random)
+        Random seed for reproducibility
     colors : list of int
-        HSV hue values for each variant (default: [200, 140, 70, 340, 280])
+        HSV hue values for each variant
     num_particles : int or None
-        Number of flow lines (None = width*height/500 for denser coverage)
+        Number of flow lines (None = width*height/500)
     max_length : int or None
-        Max trace length per particle (None = 3*width for longer trails)
+        Max trace length per particle (None = 3*width)
     step_size : float or None
-        Distance per trace step (None = 0.001*max(width, height))
+        Distance per trace step (None = 0.001*max(w,h))
     octaves : int
-        Fractal noise octaves (more = finer turbulent detail)
+        Fractal noise octaves
     persistence : float
         Amplitude falloff per octave
     lacunarity : int
         Frequency multiplier per octave
-    base_nx : int
-        Base Perlin tile count X
-    base_ny : int
-        Base Perlin tile count Y
+    base_nx, base_ny : int
+        Base Perlin tile counts
+    warp_strength : float
+        Domain warp displacement in pixels (0 = no warp, 100+ = heavy)
     parallel : bool
-        If True, render color variants in parallel processes
+        Render color variants in parallel processes
     """
     import platform
 
@@ -576,24 +584,20 @@ def draw_flow_field_enhanced(width=7680, height=4320,
 
     print(f'Enhanced Flow Field: {width}x{height}, {num_particles} particles, '
           f'{len(colors)} variants, seed={seed}')
-    print(f'Fractal noise: {octaves} octaves, persistence={persistence}, '
-          f'lacunarity={lacunarity}')
+    print(f'Noise: {octaves} octaves, persistence={persistence}, '
+          f'lacunarity={lacunarity}, warp={warp_strength}px')
 
-    # Each variant gets a unique seed derived from the base seed, offset by a
-    # prime so the noise fields are fully decorrelated from one another
     task_args = []
     for i, mod in enumerate(colors):
         variant_seed = seed + i * 7919
         task_args.append((width, height, mod, variant_seed, num_particles,
-                          max_length, step_size, noise_params))
+                          max_length, step_size, noise_params, warp_strength))
 
     t0 = time.time()
 
     if parallel and len(colors) > 1:
         import multiprocessing as mp
 
-        # macOS (Apple Silicon) should use 'fork' for fast subprocess start;
-        # Windows must use 'spawn' as it lacks fork(). We detect and adapt.
         if platform.system() == 'Darwin':
             ctx = mp.get_context('fork')
         elif platform.system() == 'Windows':
