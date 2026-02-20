@@ -566,6 +566,7 @@ def draw_flow_field_enhanced(width=7680, height=4320,
                              lacunarity=2,
                              base_nx=2, base_ny=2,
                              warp_strength=100.0,
+                             multi_field=True,
                              parallel=True):
     """
     Enhanced flow field generator with domain-warped curl noise.
@@ -588,15 +589,18 @@ def draw_flow_field_enhanced(width=7680, height=4320,
     step_size : float or None
         Distance per trace step (None = 0.001*max(w,h))
     octaves : int
-        Fractal noise octaves
+        Base fractal noise octaves (varied per variant if multi_field=True)
     persistence : float
-        Amplitude falloff per octave
+        Base amplitude falloff per octave
     lacunarity : int
         Frequency multiplier per octave
     base_nx, base_ny : int
         Base Perlin tile counts
     warp_strength : float
-        Domain warp displacement in pixels (0 = no warp, 100+ = heavy)
+        Base domain warp displacement in pixels (0 = no warp)
+    multi_field : bool
+        If True, randomize noise parameters per variant so every image
+        has unique structure, not just a different seed on the same config
     parallel : bool
         Render color variants in parallel processes
     """
@@ -613,19 +617,41 @@ def draw_flow_field_enhanced(width=7680, height=4320,
     if step_size is None:
         step_size = 0.001 * max(width, height)
 
-    noise_params = (octaves, persistence, lacunarity, base_nx, base_ny)
-
     print(f'Enhanced Flow Field: {width}x{height}, {num_particles} particles, '
           f'{len(palettes)} variants, seed={seed}')
     print(f'Palettes: {palettes}')
-    print(f'Noise: {octaves} octaves, persistence={persistence}, '
-          f'lacunarity={lacunarity}, warp={warp_strength}px')
 
+    # --- #6 Multi-field control ---
+    # Each variant gets its own noise parameters derived from the base values,
+    # so every image has genuinely different field character.
     task_args = []
     for i, pal in enumerate(palettes):
         variant_seed = seed + i * 7919
+
+        if multi_field:
+            rng = np.random.RandomState(variant_seed)
+            v_octaves = max(3, octaves + rng.randint(-2, 3))
+            v_persistence = np.clip(persistence + rng.uniform(-0.15, 0.15),
+                                    0.3, 0.7)
+            v_nx = rng.choice([1, 2, 3, 4])
+            v_ny = rng.choice([1, 2, 3, 4])
+            v_warp = max(0, warp_strength + rng.uniform(-40, 40))
+            print(f'  {pal}: octaves={v_octaves}, persistence={v_persistence:.2f}, '
+                  f'tiles={v_nx}x{v_ny}, warp={v_warp:.0f}px')
+        else:
+            v_octaves = octaves
+            v_persistence = persistence
+            v_nx = base_nx
+            v_ny = base_ny
+            v_warp = warp_strength
+
+        noise_params = (v_octaves, v_persistence, lacunarity, v_nx, v_ny)
         task_args.append((width, height, pal, variant_seed, num_particles,
-                          max_length, step_size, noise_params, warp_strength))
+                          max_length, step_size, noise_params, v_warp))
+
+    if not multi_field:
+        print(f'Noise: {octaves} octaves, persistence={persistence}, '
+              f'lacunarity={lacunarity}, warp={warp_strength}px')
 
     t0 = time.time()
 
