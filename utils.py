@@ -122,3 +122,66 @@ def Perlin2D(width, height, n_x, n_y, clampHorizontal=False, clampVertical=False
 
     # Now perform the second dimension's linear interpolation to return value
     return u + t[:, :, 1] * (v - u)
+
+
+def FractalPerlin2D(width, height, n_x, n_y, octaves=6, persistence=0.5,
+                    lacunarity=2, clampHorizontal=False, clampVertical=False):
+    """
+    Multi-octave fractal Perlin noise (fBm) for richer, more organic patterns.
+
+    Layers multiple frequencies of Perlin noise, each with decreasing amplitude
+    and increasing frequency, producing turbulent detail at every scale.
+
+    Parameters:
+    -----------
+    width : int
+        The width of the canvas
+    height : int
+        The height of the canvas
+    n_x : int
+        Base number of x tiles for the lowest frequency octave
+    n_y : int
+        Base number of y tiles for the lowest frequency octave
+    octaves : int
+        Number of noise layers to combine (more = finer detail)
+    persistence : float
+        Amplitude decay per octave (0.5 = each octave is half as strong)
+    lacunarity : int
+        Frequency multiplier per octave (2 = each octave doubles frequency)
+    clampHorizontal : boolean
+        If True, noise wraps seamlessly along horizontal edges
+    clampVertical : boolean
+        If True, noise wraps seamlessly along vertical edges
+
+    Returns:
+    --------
+    <value> : numpy array
+        Noise values for array[width, height], normalized between -1 and 1
+    """
+    noise = np.zeros((width, height), dtype=np.float64)
+    amplitude = 1.0
+    max_amplitude = 0.0
+
+    for _ in range(octaves):
+        freq_x = n_x
+        freq_y = n_y
+
+        # Ensure frequency tiles divide evenly into canvas dimensions
+        # by snapping to the nearest valid divisor
+        while width % freq_x != 0 and freq_x > 1:
+            freq_x -= 1
+        while height % freq_y != 0 and freq_y > 1:
+            freq_y -= 1
+
+        octave_noise = Perlin2D(width, height, freq_x, freq_y,
+                                clampHorizontal, clampVertical)
+        noise += amplitude * octave_noise
+        max_amplitude += amplitude
+
+        amplitude *= persistence
+        n_x *= lacunarity
+        n_y *= lacunarity
+
+    # Normalize to [-1, 1]
+    noise /= max_amplitude
+    return noise

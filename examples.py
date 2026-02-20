@@ -15,7 +15,7 @@ from PyQt5.QtGui import QColor, QPen, QPixmap
 from PyQt5.QtCore import QPointF, QRect
 
 import painter
-from utils import QColor_HSV, save, Perlin2D
+from utils import QColor_HSV, save, Perlin2D, FractalPerlin2D
 
 
 def draw_white_noise(width, height, fname):
@@ -396,3 +396,210 @@ def draw_delta_body(width, height, seed=random.randint(0, 100000000), mode='nois
         circle.draw(dt, p)
 
     save(p, fname=f'delta_{mode}_{seed}', folder='.', overwrite=True)
+
+
+def _render_flow_field_variant(args):
+    """
+    Render a single color variant of the enhanced flow field.
+    Designed to run in a separate process for parallel rendering.
+
+    The entire flow line tracing is vectorized: all particles advance
+    simultaneously each step using NumPy bulk operations, eliminating
+    the per-particle Python loop entirely.
+    """
+    width, height, mod, seed, num_particles, max_length, step_size, noise_params = args
+    from PyQt5.QtWidgets import QApplication
+    import sys
+
+    # Each subprocess needs its own QApplication instance
+    _app = QApplication.instance() or QApplication(sys.argv)
+
+    np.random.seed(seed)
+    random.seed(seed)
+
+    p = painter.Painter(width, height)
+    p.setRenderHint(p.Antialiasing)
+    p.fillRect(0, 0, width, height, QColor(0, 0, 0))
+
+    # Generate fractal noise for this variant
+    octaves, persistence, lacunarity, base_nx, base_ny = noise_params
+    p_noise = FractalPerlin2D(width, height, base_nx, base_ny,
+                              octaves=octaves, persistence=persistence,
+                              lacunarity=lacunarity)
+
+    # --- Vectorized particle tracing ---
+    # Initialize all particles at once
+    xs = np.random.randint(0, width, size=num_particles).astype(np.float64)
+    ys = np.random.randint(0, height, size=num_particles).astype(np.float64)
+    lengths = np.zeros(num_particles, dtype=np.float64)
+    active = np.ones(num_particles, dtype=bool)
+
+    # We batch draw calls by collecting segments and flushing periodically
+    BATCH_SIZE = 50  # steps between draw flushes
+    step = 0
+
+    while np.any(active):
+        # Gather segments for this batch
+        batch_segments = []  # list of (hue, sat, x_s, y_s, x_f, y_f) arrays
+
+        for _ in range(BATCH_SIZE):
+            if not np.any(active):
+                break
+
+            idx = np.where(active)[0]
+            xi = np.clip(xs[idx].astype(np.int64), 0, width - 1)
+            yi = np.clip(ys[idx].astype(np.int64), 0, height - 1)
+
+            # Vectorized angle lookup and trig
+            angles = p_noise[xi, yi] * math.pi
+            cos_a = np.cos(angles)
+            sin_a = np.sin(angles)
+
+            # Compute new positions for all active particles at once
+            x_new = xs[idx] + step_size * cos_a
+            y_new = ys[idx] + step_size * sin_a
+
+            # Vectorized color computation
+            sat = 200.0 * (max_length - lengths[idx]) / max_length
+            hue = (mod + 130.0 * (height - ys[idx]) / height) % 360
+
+            batch_segments.append((
+                hue.copy(), sat.copy(),
+                xs[idx].copy(), ys[idx].copy(),
+                x_new.copy(), y_new.copy(),
+                idx.copy()
+            ))
+
+            # Update lengths
+            seg_len = np.sqrt((x_new - xs[idx])**2 + (y_new - ys[idx])**2)
+            lengths[idx] += seg_len
+
+            # Update positions
+            xs[idx] = x_new
+            ys[idx] = y_new
+
+            # Deactivate out-of-bounds or max-length particles
+            oob = (x_new < 0) | (x_new >= width) | (y_new < 0) | (y_new >= height)
+            maxed = lengths[idx] > max_length
+            deactivate = idx[oob | maxed]
+            active[deactivate] = False
+
+            step += 1
+
+        # Flush batch: group segments by quantized (hue, sat) to minimize setPen calls
+        for seg_data in batch_segments:
+            hue_arr, sat_arr, x0, y0, x1, y1, _ = seg_data
+
+            # Quantize colors to reduce unique pen changes (bin to nearest 5)
+            hue_q = (hue_arr / 5).astype(np.int32) * 5
+            sat_q = (sat_arr / 5).astype(np.int32) * 5
+            color_keys = hue_q * 1000 + sat_q
+
+            for ck in np.unique(color_keys):
+                mask = color_keys == ck
+                h = int(hue_q[mask][0]) % 360
+                s = max(0, min(255, int(sat_q[mask][0])))
+                p.setPen(QPen(QColor_HSV(h, s, 255, 20), 2))
+
+                # Draw all segments of this color in one burst
+                for j in np.where(mask)[0]:
+                    p.drawLine(QPointF(x0[j], y0[j]), QPointF(x1[j], y1[j]))
+
+    n_active = int(np.sum(active))
+    print(f'  Hue {mod}: done ({num_particles - n_active}/{num_particles} particles traced)')
+
+    fname = f'enhanced_flow_{mod}_{seed}'
+    save(p, fname=fname, folder='Images', overwrite=True)
+    return fname
+
+
+def draw_flow_field_enhanced(width=7680, height=4320,
+                             seed=None,
+                             colors=None,
+                             num_particles=None,
+                             max_length=None,
+                             step_size=None,
+                             octaves=6,
+                             persistence=0.5,
+                             lacunarity=2,
+                             base_nx=2, base_ny=2,
+                             parallel=True):
+    """
+    Enhanced flow field generator optimized for Apple Silicon.
+
+    Key improvements over draw_flow_field:
+    - Vectorized particle tracing (all particles advance simultaneously via NumPy)
+    - Batched QPainter draw calls grouped by color to minimize state changes
+    - Multi-octave fractal Perlin noise for richer, more organic patterns
+    - Multiprocessing to render color variants across Apple Silicon P-cores
+    - Higher default resolution (8K) and particle density
+
+    Parameters:
+    -----------
+    width : int
+        Canvas width in pixels (default: 7680 for 8K)
+    height : int
+        Canvas height in pixels (default: 4320 for 8K)
+    seed : int or None
+        Random seed for reproducibility (None = random)
+    colors : list of int
+        HSV hue values for each variant (default: [200, 140, 70, 340, 280])
+    num_particles : int or None
+        Number of flow lines (None = width*height/500 for denser coverage)
+    max_length : int or None
+        Max trace length per particle (None = 3*width for longer trails)
+    step_size : float or None
+        Distance per trace step (None = 0.001*max(width, height))
+    octaves : int
+        Fractal noise octaves (more = finer turbulent detail)
+    persistence : float
+        Amplitude falloff per octave
+    lacunarity : int
+        Frequency multiplier per octave
+    base_nx : int
+        Base Perlin tile count X
+    base_ny : int
+        Base Perlin tile count Y
+    parallel : bool
+        If True, render color variants in parallel processes
+    """
+    if seed is None:
+        seed = random.randint(0, 100000000)
+    if colors is None:
+        colors = [200, 140, 70, 340, 280]
+    if num_particles is None:
+        num_particles = int(width * height / 500)
+    if max_length is None:
+        max_length = 3 * width
+    if step_size is None:
+        step_size = 0.001 * max(width, height)
+
+    noise_params = (octaves, persistence, lacunarity, base_nx, base_ny)
+
+    print(f'Enhanced Flow Field: {width}x{height}, {num_particles} particles, '
+          f'{len(colors)} variants, seed={seed}')
+    print(f'Fractal noise: {octaves} octaves, persistence={persistence}, '
+          f'lacunarity={lacunarity}')
+
+    # Build argument tuples — each variant gets a deterministic sub-seed
+    task_args = []
+    for i, mod in enumerate(colors):
+        variant_seed = seed + i * 7919  # offset by a prime to decorrelate
+        task_args.append((width, height, mod, variant_seed, num_particles,
+                          max_length, step_size, noise_params))
+
+    t0 = time.time()
+
+    if parallel and len(colors) > 1:
+        import multiprocessing as mp
+        n_workers = min(len(colors), mp.cpu_count())
+        print(f'Rendering {len(colors)} variants in parallel ({n_workers} workers)...')
+        with mp.Pool(processes=n_workers) as pool:
+            results = pool.map(_render_flow_field_variant, task_args)
+    else:
+        print(f'Rendering {len(colors)} variants sequentially...')
+        results = [_render_flow_field_variant(a) for a in task_args]
+
+    elapsed = time.time() - t0
+    print(f'All variants complete in {elapsed:.1f}s')
+    print(f'Output files: {results}')
