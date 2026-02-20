@@ -15,7 +15,9 @@ from PyQt5.QtGui import QColor, QPen, QPixmap
 from PyQt5.QtCore import QPointF, QRect
 
 import painter
-from utils import QColor_HSV, save, Perlin2D, FractalPerlin2D
+from utils import (QColor_HSV, save, Perlin2D, FractalPerlin2D,
+                   DomainWarp, CurlNoise2D, COLOR_PALETTES, palette_color,
+                   make_attractors, apply_attractors)
 
 
 def draw_white_noise(width, height, fname):
