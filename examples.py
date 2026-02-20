@@ -412,7 +412,7 @@ def _render_flow_field_variant(args):
       5. Trace particles through the (vx, vy) field
       6. Draw with batched, color-grouped QPainter calls
     """
-    (width, height, mod, seed, num_particles, max_length, step_size,
+    (width, height, palette_name, seed, num_particles, max_length, step_size,
      noise_params, warp_strength) = args
     from PyQt5.QtWidgets import QApplication
     import sys
@@ -482,9 +482,13 @@ def _render_flow_field_variant(args):
             x_new = xs[idx] + step_size * vx
             y_new = ys[idx] + step_size * vy
 
-            # Color: saturation fades along trail, hue shifts with y-position
-            sat = 200.0 * (max_length - lengths[idx]) / max_length
-            hue = (mod + 130.0 * (height - ys[idx]) / height) % 360
+            # --- #4 Palette-based color ---
+            # Sample palette by vertical position; trail fade modulates sat
+            color_t = ys[idx] / height
+            hue, sat_base, val = palette_color(palette_name, color_t)
+            # Fade saturation along the trail (bright head -> muted tail)
+            trail_fade = (max_length - lengths[idx]) / max_length
+            sat = sat_base * trail_fade
 
             # Line weight: blend of field magnitude and trail taper
             # mag_component: 0.5-1.0 based on curl strength at this point
@@ -495,7 +499,7 @@ def _render_flow_field_variant(args):
             weight = mag_component * taper  # range ~[0.15, 1.0]
 
             batch_segments.append((
-                hue.copy(), sat.copy(),
+                hue.copy(), sat.copy(), val.copy(),
                 xs[idx].copy(), ys[idx].copy(),
                 x_new.copy(), y_new.copy(),
                 weight.copy()
@@ -511,34 +515,35 @@ def _render_flow_field_variant(args):
             active[idx[oob | maxed]] = False
 
         # Flush: group by quantized color + weight to reduce setPen calls
-        for hue_arr, sat_arr, x0, y0, x1, y1, wt_arr in batch_segments:
+        for hue_arr, sat_arr, val_arr, x0, y0, x1, y1, wt_arr in batch_segments:
             hue_q = (hue_arr / 5).astype(np.int32) * 5
             sat_q = (sat_arr / 5).astype(np.int32) * 5
-            # Quantize weight to 4 discrete bins (0.5, 1.5, 2.5, 3.5 px)
+            val_q = (val_arr / 5).astype(np.int32) * 5
             wt_q = np.clip((wt_arr * 4).astype(np.int32), 0, 3)
-            color_keys = hue_q * 10000 + sat_q * 10 + wt_q
+            color_keys = hue_q * 100000 + sat_q * 1000 + val_q * 10 + wt_q
 
             for ck in np.unique(color_keys):
                 mask = color_keys == ck
                 h = int(hue_q[mask][0]) % 360
                 s = max(0, min(255, int(sat_q[mask][0])))
-                w = 0.5 + int(wt_q[mask][0])  # pen width: 0.5, 1.5, 2.5, 3.5
-                p.setPen(QPen(QColor_HSV(h, s, 255, 20), w))
+                v = max(0, min(255, int(val_q[mask][0])))
+                w = 0.5 + int(wt_q[mask][0])
+                p.setPen(QPen(QColor_HSV(h, s, v, 20), w))
 
                 for j in np.where(mask)[0]:
                     p.drawLine(QPointF(x0[j], y0[j]), QPointF(x1[j], y1[j]))
 
     traced = num_particles - int(np.sum(active))
-    print(f'  Hue {mod}: done ({traced}/{num_particles} particles traced)')
+    print(f'  {palette_name}: done ({traced}/{num_particles} particles traced)')
 
-    fname = f'enhanced_flow_{mod}_{seed}'
+    fname = f'enhanced_flow_{palette_name}_{seed}'
     save(p, fname=fname, folder='Images', overwrite=True)
     return fname
 
 
 def draw_flow_field_enhanced(width=7680, height=4320,
                              seed=None,
-                             colors=None,
+                             palettes=None,
                              num_particles=None,
                              max_length=None,
                              step_size=None,
@@ -553,18 +558,15 @@ def draw_flow_field_enhanced(width=7680, height=4320,
 
     Noise pipeline: FractalPerlin -> DomainWarp -> CurlNoise -> (vx, vy)
 
-    This produces divergence-free flow (no sinks/sources) through a
-    coordinate-warped potential field, giving swirling, turbulent,
-    fluid-like structures impossible with plain Perlin angle mapping.
-
     Parameters:
     -----------
     width, height : int
         Canvas dimensions (default: 7680x4320 for 8K)
     seed : int or None
         Random seed for reproducibility
-    colors : list of int
-        HSV hue values for each variant
+    palettes : list of str
+        Color palette names from COLOR_PALETTES for each variant.
+        Available: ocean, sunset, forest, neon, ember, ice, aurora, monochrome
     num_particles : int or None
         Number of flow lines (None = width*height/500)
     max_length : int or None
@@ -588,8 +590,8 @@ def draw_flow_field_enhanced(width=7680, height=4320,
 
     if seed is None:
         seed = random.randint(0, 100000000)
-    if colors is None:
-        colors = [200, 140, 70, 340, 280]
+    if palettes is None:
+        palettes = ['ocean', 'sunset', 'forest', 'neon', 'ember']
     if num_particles is None:
         num_particles = int(width * height / 500)
     if max_length is None:
@@ -600,19 +602,20 @@ def draw_flow_field_enhanced(width=7680, height=4320,
     noise_params = (octaves, persistence, lacunarity, base_nx, base_ny)
 
     print(f'Enhanced Flow Field: {width}x{height}, {num_particles} particles, '
-          f'{len(colors)} variants, seed={seed}')
+          f'{len(palettes)} variants, seed={seed}')
+    print(f'Palettes: {palettes}')
     print(f'Noise: {octaves} octaves, persistence={persistence}, '
           f'lacunarity={lacunarity}, warp={warp_strength}px')
 
     task_args = []
-    for i, mod in enumerate(colors):
+    for i, pal in enumerate(palettes):
         variant_seed = seed + i * 7919
-        task_args.append((width, height, mod, variant_seed, num_particles,
+        task_args.append((width, height, pal, variant_seed, num_particles,
                           max_length, step_size, noise_params, warp_strength))
 
     t0 = time.time()
 
-    if parallel and len(colors) > 1:
+    if parallel and len(palettes) > 1:
         import multiprocessing as mp
 
         if platform.system() == 'Darwin':
@@ -622,13 +625,13 @@ def draw_flow_field_enhanced(width=7680, height=4320,
         else:
             ctx = mp.get_context()
 
-        n_workers = min(len(colors), ctx.cpu_count())
-        print(f'Rendering {len(colors)} variants in parallel '
+        n_workers = min(len(palettes), ctx.cpu_count())
+        print(f'Rendering {len(palettes)} variants in parallel '
               f'({n_workers} workers, {ctx.get_start_method()} mode)...')
         with ctx.Pool(processes=n_workers) as pool:
             results = pool.map(_render_flow_field_variant, task_args)
     else:
-        print(f'Rendering {len(colors)} variants sequentially...')
+        print(f'Rendering {len(palettes)} variants sequentially...')
         results = [_render_flow_field_variant(a) for a in task_args]
 
     elapsed = time.time() - t0

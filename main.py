@@ -20,6 +20,7 @@ if __name__ == '__main__':
     draw_flow_field_enhanced(
         width=7680,
         height=4320,
+        palettes=['ocean', 'sunset', 'forest', 'neon', 'ember'],
         octaves=6,              # fractal detail layers
         persistence=0.5,        # amplitude decay per octave
         lacunarity=2,           # frequency doubling per octave
