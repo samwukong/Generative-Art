@@ -18,6 +18,7 @@ import painter
 from utils import (QColor_HSV, save, Perlin2D, FractalPerlin2D,
                    DomainWarp, CurlNoise2D, COLOR_PALETTES, palette_color,
                    make_attractors, apply_attractors)
+from metal_compute import MetalTracer
 
 
 def draw_white_noise(width, height, fname):
@@ -461,6 +462,13 @@ def _render_flow_field_variant(args):
     # Each variant gets its own arrangement (seeded from variant seed).
     attractors = make_attractors(width, height, n_attractors=3, n_repulsors=2,
                                  seed=seed)
+    influence_radius = max(width, height) * 0.3
+
+    # --- #8 Metal GPU acceleration ---
+    # Offload particle advection to GPU if Metal is available (macOS only).
+    # Falls back to NumPy transparently on Linux/Windows.
+    gpu = MetalTracer(width, height, vx_field, vy_field, attractors,
+                      influence_radius)
 
     # --- #7 Depth Layering ---
     # Render particles in back-to-front layers. Back layers are faint/thin
@@ -501,31 +509,64 @@ def _render_flow_field_variant(args):
                 if not np.any(active):
                     break
 
-                idx = np.where(active)[0]
-                xi = np.clip(xs[idx].astype(np.int64), 0, width - 1)
-                yi = np.clip(ys[idx].astype(np.int64), 0, height - 1)
+                if gpu.gpu_available:
+                    # --- GPU path: Metal computes advection ---
+                    old_xs, old_ys, new_xs, new_ys, was_active = \
+                        gpu.step_gpu(xs, ys, lengths, active,
+                                     l_step, max_length)
 
-                # Sample curl velocity, then blend in attractor/repulsor forces
-                vx = vx_field[xi, yi]
-                vy = vy_field[xi, yi]
-                vx, vy = apply_attractors(xs[idx], ys[idx], vx, vy, attractors,
-                                          influence_radius=max(width, height) * 0.3)
+                    # Filter to particles that were active this step
+                    idx = np.where(was_active)[0]
+                    if len(idx) == 0:
+                        break
+                    xi = np.clip(old_xs[idx].astype(np.int64), 0, width - 1)
+                    yi = np.clip(old_ys[idx].astype(np.int64), 0, height - 1)
+                    x_old_seg = old_xs[idx]
+                    y_old_seg = old_ys[idx]
+                    x_new_seg = new_xs[idx]
+                    y_new_seg = new_ys[idx]
+                else:
+                    # --- CPU path: NumPy advection ---
+                    idx = np.where(active)[0]
+                    xi = np.clip(xs[idx].astype(np.int64), 0, width - 1)
+                    yi = np.clip(ys[idx].astype(np.int64), 0, height - 1)
 
-                vmag = np.sqrt(vx**2 + vy**2)
-                vmag[vmag < 1e-10] = 1e-10
-                vx /= vmag
-                vy /= vmag
+                    vx = vx_field[xi, yi]
+                    vy = vy_field[xi, yi]
+                    vx, vy = apply_attractors(
+                        xs[idx], ys[idx], vx, vy, attractors,
+                        influence_radius=influence_radius)
 
-                x_new = xs[idx] + l_step * vx
-                y_new = ys[idx] + l_step * vy
+                    vmag = np.sqrt(vx**2 + vy**2)
+                    vmag[vmag < 1e-10] = 1e-10
+                    vx /= vmag
+                    vy /= vmag
 
-                # --- #4 Palette-based color ---
-                color_t = ys[idx] / height
+                    x_new = xs[idx] + l_step * vx
+                    y_new = ys[idx] + l_step * vy
+
+                    x_old_seg = xs[idx].copy()
+                    y_old_seg = ys[idx].copy()
+                    x_new_seg = x_new
+                    y_new_seg = y_new
+
+                    seg_len = np.sqrt((x_new - xs[idx])**2 +
+                                      (y_new - ys[idx])**2)
+                    lengths[idx] += seg_len
+                    xs[idx] = x_new
+                    ys[idx] = y_new
+
+                    oob = ((x_new < 0) | (x_new >= width) |
+                           (y_new < 0) | (y_new >= height))
+                    maxed = lengths[idx] > max_length
+                    active[idx[oob | maxed]] = False
+
+                # --- Color and weight (shared by GPU and CPU paths) ---
+                color_t = y_old_seg / height
                 hue, sat_base, val = palette_color(palette_name, color_t)
                 trail_fade = (max_length - lengths[idx]) / max_length
                 sat = sat_base * trail_fade * l_sat_scale
 
-                # Line weight: field magnitude * trail taper * layer scale
                 trail_t = lengths[idx] / max_length
                 mag_component = 0.5 + 0.5 * mag_norm[xi, yi]
                 taper = 1.0 - 0.7 * trail_t
@@ -533,19 +574,10 @@ def _render_flow_field_variant(args):
 
                 batch_segments.append((
                     hue.copy(), sat.copy(), val.copy(),
-                    xs[idx].copy(), ys[idx].copy(),
-                    x_new.copy(), y_new.copy(),
+                    x_old_seg.copy(), y_old_seg.copy(),
+                    x_new_seg.copy(), y_new_seg.copy(),
                     weight.copy()
                 ))
-
-                seg_len = np.sqrt((x_new - xs[idx])**2 + (y_new - ys[idx])**2)
-                lengths[idx] += seg_len
-                xs[idx] = x_new
-                ys[idx] = y_new
-
-                oob = (x_new < 0) | (x_new >= width) | (y_new < 0) | (y_new >= height)
-                maxed = lengths[idx] > max_length
-                active[idx[oob | maxed]] = False
 
             # Flush: group by quantized color + weight to reduce setPen calls
             for hue_arr, sat_arr, val_arr, x0, y0, x1, y1, wt_arr in batch_segments:
