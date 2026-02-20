@@ -5,7 +5,9 @@
 import os
 import random
 
-from examples import draw_flow_field, draw_delta_body, draw_white_noise, draw_perlin, draw_vectors, draw_perlin_rounding
+from examples import (draw_flow_field, draw_delta_body, draw_white_noise,
+                      draw_perlin, draw_vectors, draw_perlin_rounding,
+                      draw_flow_field_enhanced)
 
 
 if __name__ == '__main__':
@@ -13,7 +15,19 @@ if __name__ == '__main__':
     if not os.path.exists(output_folder):
         os.mkdir(output_folder)
 
-        draw_flow_field(6000, 4000)
+    # --- Enhanced flow field (optimized for Apple Silicon) ---
+    # 8K resolution, fractal noise, vectorized tracing, multiprocessing
+    draw_flow_field_enhanced(
+        width=7680,
+        height=4320,
+        octaves=6,          # fractal detail layers
+        persistence=0.5,    # amplitude decay per octave
+        lacunarity=2,       # frequency doubling per octave
+        parallel=True,      # render color variants across CPU cores
+    )
+
+    # --- Original examples (uncomment to use) ---
+    # draw_flow_field(6000, 4000)
     # draw_white_noise(600, 300, f'{output_folder}/white_noise.jpg')
     # draw_perlin(5, 5, 1000, 1000, 'output_image.jpg')
     # draw_vectors(5, 5, 1000, 1000)
