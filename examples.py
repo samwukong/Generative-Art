@@ -445,11 +445,16 @@ def _render_flow_field_variant(args):
     # particles flow along iso-lines, never converging to a point
     vx_field, vy_field = CurlNoise2D(potential, scale=1.0)
 
-    # Normalize velocity magnitude so step_size controls speed uniformly
+    # --- #3 Variable Line Weight ---
+    # Keep raw magnitude before normalizing — this drives pen width.
+    # High curl gradient = thick lines, low = thin. Reveals field structure.
     mag = np.sqrt(vx_field**2 + vy_field**2)
     mag[mag < 1e-10] = 1e-10
     vx_field /= mag
     vy_field /= mag
+
+    # Normalize magnitude to [0, 1] for weight lookup
+    mag_norm = (mag - mag.min()) / (mag.max() - mag.min() + 1e-10)
 
     # --- Particle tracing (vectorized) ---
     xs = np.random.randint(0, width, size=num_particles).astype(np.float64)
@@ -481,10 +486,19 @@ def _render_flow_field_variant(args):
             sat = 200.0 * (max_length - lengths[idx]) / max_length
             hue = (mod + 130.0 * (height - ys[idx]) / height) % 360
 
+            # Line weight: blend of field magnitude and trail taper
+            # mag_component: 0.5-1.0 based on curl strength at this point
+            # taper: 1.0 at head, fading to 0.3 at tail
+            trail_t = lengths[idx] / max_length
+            mag_component = 0.5 + 0.5 * mag_norm[xi, yi]
+            taper = 1.0 - 0.7 * trail_t
+            weight = mag_component * taper  # range ~[0.15, 1.0]
+
             batch_segments.append((
                 hue.copy(), sat.copy(),
                 xs[idx].copy(), ys[idx].copy(),
-                x_new.copy(), y_new.copy()
+                x_new.copy(), y_new.copy(),
+                weight.copy()
             ))
 
             seg_len = np.sqrt((x_new - xs[idx])**2 + (y_new - ys[idx])**2)
@@ -496,17 +510,20 @@ def _render_flow_field_variant(args):
             maxed = lengths[idx] > max_length
             active[idx[oob | maxed]] = False
 
-        # Flush: group by quantized color to reduce setPen calls
-        for hue_arr, sat_arr, x0, y0, x1, y1 in batch_segments:
+        # Flush: group by quantized color + weight to reduce setPen calls
+        for hue_arr, sat_arr, x0, y0, x1, y1, wt_arr in batch_segments:
             hue_q = (hue_arr / 5).astype(np.int32) * 5
             sat_q = (sat_arr / 5).astype(np.int32) * 5
-            color_keys = hue_q * 1000 + sat_q
+            # Quantize weight to 4 discrete bins (0.5, 1.5, 2.5, 3.5 px)
+            wt_q = np.clip((wt_arr * 4).astype(np.int32), 0, 3)
+            color_keys = hue_q * 10000 + sat_q * 10 + wt_q
 
             for ck in np.unique(color_keys):
                 mask = color_keys == ck
                 h = int(hue_q[mask][0]) % 360
                 s = max(0, min(255, int(sat_q[mask][0])))
-                p.setPen(QPen(QColor_HSV(h, s, 255, 20), 2))
+                w = 0.5 + int(wt_q[mask][0])  # pen width: 0.5, 1.5, 2.5, 3.5
+                p.setPen(QPen(QColor_HSV(h, s, 255, 20), w))
 
                 for j in np.where(mask)[0]:
                     p.drawLine(QPointF(x0[j], y0[j]), QPointF(x1[j], y1[j]))
